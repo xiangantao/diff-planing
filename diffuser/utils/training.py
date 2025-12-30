@@ -83,9 +83,10 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
 
-        assert (
-            eval_freq % save_freq == 0
-        ), f"eval_freq must be a multiple of save_freq, but got {eval_freq} and {save_freq} respectively"
+        # NOTE:
+        # Historically we required `eval_freq % save_freq == 0` because the evaluator loads checkpoints from disk.
+        # We now support evaluating at arbitrary steps by saving a rolling `checkpoint/state.pt` before eval,
+        # while still optionally saving snapshots `state_<step>.pt` at `save_freq`.
         self.log_freq = log_freq
         self.sample_freq = sample_freq
         self.save_freq = save_freq
@@ -266,8 +267,9 @@ class Trainer(object):
 
     def finish_training(self):
         if self.step % self.save_freq == 0:
-            self.save()
-        if self.eval_freq > 0 and self.step % self.eval_freq == 0:
+            self.save(save_snapshot=True)
+        if self.eval_freq > 0 and self.step > 0 and self.step % self.eval_freq == 0:
+            self.save(save_snapshot=False)
             self.evaluate()
         if self.evaluator is not None:
             del self.evaluator
@@ -363,11 +365,13 @@ class Trainer(object):
                 self.step_ema()
 
             if self.step % self.save_freq == 0:
-                self.save()
+                self.save(save_snapshot=True)
 
             # NOTE: avoid evaluating at step=0 (it can be very slow and competes with training on the same GPU),
             # and it makes logs look "stuck" when log_freq is large.
             if self.eval_freq > 0 and self.step > 0 and self.step % self.eval_freq == 0:
+                # Make sure evaluator can load this exact step even if `eval_freq` is not aligned with `save_freq`.
+                self.save(save_snapshot=False)
                 self.evaluate()
 
             if self.step % self.log_freq == 0:
@@ -402,7 +406,7 @@ class Trainer(object):
         ), "Method `evaluate` can not be called when `self.evaluator` is None. Set evaluator with `self.set_evaluator` first."
         self.evaluator.evaluate(load_step=self.step)
 
-    def save(self):
+    def save(self, save_snapshot: bool = False):
         """
         saves model and ema to disk;
         syncs to storage bucket if a bucket is specified
@@ -413,14 +417,21 @@ class Trainer(object):
             "model": self.model.state_dict(),
             "ema": self.ema_model.state_dict(),
         }
-        savepath = os.path.join(self.bucket, logger.prefix, "checkpoint")
-        os.makedirs(savepath, exist_ok=True)
-        if self.save_checkpoints:
-            savepath = os.path.join(savepath, f"state_{self.step}.pt")
-        else:
-            savepath = os.path.join(savepath, "state.pt")
-        torch.save(data, savepath)
-        logger.print(f"[ utils/training ] Saved model to {savepath}")
+        ckpt_dir = os.path.join(self.bucket, logger.prefix, "checkpoint")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Always save a rolling checkpoint so evaluation can load at any step.
+        latest_path = os.path.join(ckpt_dir, "state.pt")
+        torch.save(data, latest_path)
+
+        saved_paths = [latest_path]
+        # Optionally save step snapshots at the (lower) save frequency.
+        if self.save_checkpoints and save_snapshot:
+            step_path = os.path.join(ckpt_dir, f"state_{self.step}.pt")
+            torch.save(data, step_path)
+            saved_paths.append(step_path)
+
+        logger.print(f"[ utils/training ] Saved model to {', '.join(saved_paths)}")
 
     def load(self):
         """

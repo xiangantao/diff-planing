@@ -145,9 +145,14 @@ class MADEvaluatorWorker(Process):
 
         utils.set_seed(Config.seed)
 
+        # Support evaluating at arbitrary steps:
+        # - Prefer step snapshot if present (state_<step>.pt)
+        # - Otherwise fall back to rolling checkpoint (state.pt)
         if Config.save_checkpoints:
             assert load_step is not None
-            loadpath = os.path.join(loadpath, f"state_{load_step}.pt")
+            step_path = os.path.join(loadpath, f"state_{load_step}.pt")
+            latest_path = os.path.join(loadpath, "state.pt")
+            loadpath = step_path if os.path.exists(step_path) else latest_path
         else:
             loadpath = os.path.join(loadpath, "state.pt")
 

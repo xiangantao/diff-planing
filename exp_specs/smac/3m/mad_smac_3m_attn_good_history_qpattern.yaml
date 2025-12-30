@@ -2,7 +2,7 @@ meta_data:
   exp_name: "mad_smac"
   script_path: "run_scripts/train.py"
   num_workers: 2
-  job_name: "{dataset}/qpattern-h_{horizon}-hh_{history_horizon}-{model}-r_{returns_scale}-guidew_{condition_guidance_w}-ctde_{decentralized_execution}"
+  job_name: "{dataset}/qpattern123002-h_{horizon}-hh_{history_horizon}-{model}-r_{returns_scale}-guidew_{condition_guidance_w}-ctde_{decentralized_execution}"
 
 variables:
   seed: [100]
@@ -60,9 +60,9 @@ constants:
   termination_penalty: 0.0
 
   # training
-  n_steps_per_epoch: 10000
-  n_train_steps: 1000000
-  batch_size: 32
+  n_steps_per_epoch: 1000
+  n_train_steps: 100000
+  batch_size: 512
   learning_rate: 0.0005
   gradient_accumulate_every: 2
   ema_decay: 0.995
@@ -78,7 +78,7 @@ constants:
   evaluator: "utils.MADEvaluator"
   num_envs: 10
   num_eval: 100
-  eval_freq: 100000
+  eval_freq: 2000
 
   # load checkpoint
   continue_training: True
@@ -92,16 +92,16 @@ constants:
   q_pattern_hidden_dim: 512
   q_pattern_encoder_hidden_dim: 256
 
-  rollout_every: 50
+  rollout_every: 100
   rollout_ddim_steps: 15
-  rollout_batch_size: 2
+  rollout_batch_size: 64
   rollout_use_cfg: True
-  rollout_policy_weight: 0.1
-  rollout_bc_weight: 1.0
+  rollout_policy_weight: 0.01
+  rollout_bc_weight: 0.1
 
   # warmup schedule: first pretrain transition_q, then warmup pattern_q, then enable rollout policy loss
-  transition_q_pretrain_steps: 1000
-  pattern_q_warmup_steps: 2000
+  transition_q_pretrain_steps: 2000
+  pattern_q_warmup_steps: 1000
 
   # cleaner evaluator logging
   log_episode_details: False
