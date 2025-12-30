@@ -365,7 +365,9 @@ class Trainer(object):
             if self.step % self.save_freq == 0:
                 self.save()
 
-            if self.eval_freq > 0 and self.step % self.eval_freq == 0:
+            # NOTE: avoid evaluating at step=0 (it can be very slow and competes with training on the same GPU),
+            # and it makes logs look "stuck" when log_freq is large.
+            if self.eval_freq > 0 and self.step > 0 and self.step % self.eval_freq == 0:
                 self.evaluate()
 
             if self.step % self.log_freq == 0:
