@@ -137,6 +137,12 @@ def main(Config, RUN):
         data_encoder=data_encoder,
         use_inv_dyn=Config.use_inv_dyn,
         device=Config.device,
+        # Q_pattern (obs-diffusion) - optional
+        use_q_pattern=getattr(Config, "use_q_pattern", False),
+        q_pattern_latent_dim=getattr(Config, "q_pattern_latent_dim", 64),
+        q_pattern_hidden_dim=getattr(Config, "q_pattern_hidden_dim", 512),
+        q_pattern_encoder_hidden_dim=getattr(Config, "q_pattern_encoder_hidden_dim", 256),
+        transition_q_hidden_dim=getattr(Config, "transition_q_hidden_dim", 512),
     )
 
     trainer_config = utils.Config(
@@ -156,6 +162,15 @@ def main(Config, RUN):
         n_reference=Config.n_reference,
         train_device=Config.device,
         save_checkpoints=Config.save_checkpoints,
+        # Q_pattern rollout schedule + optimizers (optional)
+        transition_q_lr=getattr(Config, "transition_q_lr", 1e-4),
+        pattern_q_lr=getattr(Config, "pattern_q_lr", 1e-4),
+        rollout_every=getattr(Config, "rollout_every", 0),
+        rollout_ddim_steps=getattr(Config, "rollout_ddim_steps", 15),
+        rollout_batch_size=getattr(Config, "rollout_batch_size", 4),
+        rollout_use_cfg=getattr(Config, "rollout_use_cfg", True),
+        rollout_policy_weight=getattr(Config, "rollout_policy_weight", 0.1),
+        rollout_bc_weight=getattr(Config, "rollout_bc_weight", 1.0),
     )
 
     evaluator_config = utils.Config(
@@ -188,8 +203,9 @@ def main(Config, RUN):
                 color="green",
             )
             trainer.step = state_dict["step"]
-            trainer.model.load_state_dict(state_dict["model"])
-            trainer.ema_model.load_state_dict(state_dict["ema"])
+            # allow new optional modules (e.g. Q_pattern) to be added without breaking resume
+            trainer.model.load_state_dict(state_dict["model"], strict=False)
+            trainer.ema_model.load_state_dict(state_dict["ema"], strict=False)
 
     # -----------------------------------------------------------------------------#
     # ------------------------ test forward & backward pass -----------------------#

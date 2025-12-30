@@ -3,6 +3,7 @@ import os
 
 import einops
 import torch
+import torch.nn.functional as F
 from ml_logger import logger
 
 import diffuser
@@ -61,6 +62,15 @@ class Trainer(object):
         bucket=None,
         train_device="cuda",
         save_checkpoints=False,
+        # ---------------- Q_pattern (obs-diffusion) ----------------
+        transition_q_lr: float = 1e-4,
+        pattern_q_lr: float = 1e-4,
+        rollout_every: int = 0,
+        rollout_ddim_steps: int = 15,
+        rollout_batch_size: int = 4,
+        rollout_use_cfg: bool = True,
+        rollout_policy_weight: float = 0.1,
+        rollout_bc_weight: float = 1.0,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -106,7 +116,40 @@ class Trainer(object):
             )
 
         self.renderer = renderer
-        self.optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=train_lr)
+        # ---------------- optimizers ----------------
+        self.use_q_pattern = bool(getattr(diffusion_model, "use_q_pattern", False))
+        self.rollout_every = int(rollout_every)
+        self.rollout_ddim_steps = int(rollout_ddim_steps)
+        self.rollout_batch_size = int(rollout_batch_size)
+        self.rollout_use_cfg = bool(rollout_use_cfg)
+        self.rollout_policy_weight = float(rollout_policy_weight)
+        self.rollout_bc_weight = float(rollout_bc_weight)
+
+        self.transition_q_optimizer = None
+        self.pattern_q_optimizer = None
+
+        if self.use_q_pattern:
+            assert hasattr(diffusion_model, "transition_q")
+            assert hasattr(diffusion_model, "pattern_encoder")
+            assert hasattr(diffusion_model, "pattern_q")
+
+            # Exclude critic params from the policy optimizer (same philosophy as cc_trainer)
+            critic_param_ids = set()
+            for p in diffusion_model.transition_q.parameters():
+                critic_param_ids.add(id(p))
+            for p in diffusion_model.pattern_q.parameters():
+                critic_param_ids.add(id(p))
+
+            policy_params = [p for p in diffusion_model.parameters() if id(p) not in critic_param_ids]
+            self.optimizer = torch.optim.Adam(policy_params, lr=train_lr)
+            self.transition_q_optimizer = torch.optim.Adam(
+                diffusion_model.transition_q.parameters(), lr=transition_q_lr
+            )
+            self.pattern_q_optimizer = torch.optim.Adam(
+                diffusion_model.pattern_q.parameters(), lr=pattern_q_lr
+            )
+        else:
+            self.optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=train_lr)
 
         self.bucket = bucket
         self.n_reference = n_reference
@@ -116,6 +159,102 @@ class Trainer(object):
 
         self.evaluator = None
         self.device = train_device
+
+    def _slice_batch(self, batch, n: int):
+        out = {}
+        for k, v in batch.items():
+            if k == "cond":
+                out["cond"] = {ck: cv[:n] for ck, cv in v.items()}
+            elif torch.is_tensor(v):
+                out[k] = v[:n]
+            else:
+                out[k] = v
+        return out
+
+    def _transition_q_loss(self, batch):
+        """
+        Supervised transition critic training (fast first version):
+            Q_tau(h_t, s_{t+1}) ~= returns
+        """
+        if (not self.use_q_pattern) or ("returns" not in batch):
+            return None
+
+        action_dim = self.model.action_dim
+        H = self.model.history_horizon
+
+        obs = batch["x"][..., action_dim:]  # [B, T, A, D_obs]
+        h_obs = obs[:, : H + 1]  # [B, H+1, A, D_obs]
+        s_tp1 = obs[:, H + 1]  # [B, A, D_obs]
+
+        # returns: [B, 1, A] -> scalar label per batch item
+        target = batch["returns"].mean(dim=-1)  # [B,1]
+        pred = self.model.transition_q(h_obs, s_tp1)
+        return F.mse_loss(pred, target)
+
+    def _qpattern_rollout_losses(self, batch):
+        """
+        DDIM rollout (differentiable) + policy loss via PatternQ + rollout BC via inv_model,
+        plus a distillation loss for pattern_q (trained separately).
+        """
+        assert self.use_q_pattern
+        bsz = min(self.rollout_batch_size, batch["x"].shape[0])
+        b = self._slice_batch(batch, bsz)
+
+        action_dim = self.model.action_dim
+        H = self.model.history_horizon
+
+        # rollout obs with diffusion chain
+        obs_plan, chain_obs = self.model.conditional_sample_grad(
+            cond=b["cond"],
+            returns=b.get("returns", None),
+            env_ts=b.get("env_ts", None),
+            attention_masks=b.get("attention_masks", None),
+            n_ddim_steps=self.rollout_ddim_steps,
+            use_cfg=self.rollout_use_cfg,
+            return_diffusion=True,
+        )
+
+        # history window for Q inputs
+        h_obs = obs_plan[:, : H + 1]
+        s_tp1_plan = obs_plan[:, H + 1]
+
+        # pattern latent from the *full* obs diffusion chain
+        pattern_latent = self.model.pattern_encoder(chain_obs)
+
+        # ---- policy loss: maximize q_pattern, but do NOT update pattern_q params here
+        pattern_q_params = list(self.model.pattern_q.parameters())
+        prev_req = [p.requires_grad for p in pattern_q_params]
+        for p in pattern_q_params:
+            p.requires_grad_(False)
+
+        q_pattern = self.model.pattern_q(h_obs, pattern_latent)
+        policy_loss = -q_pattern.mean()
+
+        for p, r in zip(pattern_q_params, prev_req):
+            p.requires_grad_(r)
+
+        # ---- rollout BC via inv-dynamics (use dataset actions as targets)
+        actions_gt = b["x"][..., :action_dim]
+        x_roll = torch.cat([actions_gt, obs_plan], dim=-1)
+        inv_loss_roll, _ = self.model.compute_inv_loss(
+            x_roll,
+            b["loss_masks"],
+            legal_actions=None,
+        )
+
+        # ---- distillation for pattern_q (teacher: transition_q on rollout next state)
+        with torch.no_grad():
+            q_label = self.model.transition_q(h_obs.detach(), s_tp1_plan.detach()).detach()
+        distill_pred = self.model.pattern_q(h_obs.detach(), pattern_latent.detach())
+        pattern_q_loss = F.mse_loss(distill_pred, q_label)
+
+        info = {
+            "q_pattern": q_pattern.detach().mean(),
+            "rollout_inv_loss": inv_loss_roll.detach(),
+            "pattern_q_loss": pattern_q_loss.detach(),
+        }
+
+        return policy_loss, inv_loss_roll, pattern_q_loss, info
 
     def set_evaluator(self, evaluator):
         self.evaluator = evaluator
@@ -144,15 +283,59 @@ class Trainer(object):
     def train(self, n_train_steps):
         timer = Timer()
         for _ in range(n_train_steps):
+            pattern_q_loss_to_step = None
+            rollout_info = {}
+
+            # zero grads for each optimizer
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.transition_q_optimizer is not None:
+                self.transition_q_optimizer.zero_grad(set_to_none=True)
+
             for i in range(self.gradient_accumulate_every):
                 batch = next(self.dataloader)
                 batch = batch_to_device(batch, device=self.device)
                 loss, infos = self.model.loss(**batch)
-                loss = loss / self.gradient_accumulate_every
-                loss.backward()
+
+                # transition_q supervised update (cheap, every step)
+                if self.transition_q_optimizer is not None:
+                    q_loss = self._transition_q_loss(batch)
+                    if q_loss is not None:
+                        (q_loss / self.gradient_accumulate_every).backward()
+                        infos["transition_q_loss"] = q_loss.detach()
+
+                # low-frequency rollout loss (DDIM-15) for Q_pattern + rollout BC
+                if (
+                    self.use_q_pattern
+                    and self.rollout_every > 0
+                    and (self.step % self.rollout_every == 0)
+                    and i == 0
+                ):
+                    policy_loss, rollout_inv_loss, pattern_q_loss, roll_infos = (
+                        self._qpattern_rollout_losses(batch)
+                    )
+                    rollout_info = roll_infos
+                    loss = (
+                        loss
+                        + self.rollout_policy_weight * policy_loss
+                        + self.rollout_bc_weight * rollout_inv_loss
+                    )
+                    pattern_q_loss_to_step = pattern_q_loss
+
+                (loss / self.gradient_accumulate_every).backward()
 
             self.optimizer.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            if self.transition_q_optimizer is not None:
+                self.transition_q_optimizer.step()
+                self.transition_q_optimizer.zero_grad(set_to_none=True)
+
+            # train pattern_q only when we ran a rollout
+            if self.pattern_q_optimizer is not None and pattern_q_loss_to_step is not None:
+                self.pattern_q_optimizer.zero_grad(set_to_none=True)
+                pattern_q_loss_to_step.backward()
+                self.pattern_q_optimizer.step()
+                self.pattern_q_optimizer.zero_grad(set_to_none=True)
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
@@ -164,6 +347,7 @@ class Trainer(object):
                 self.evaluate()
 
             if self.step % self.log_freq == 0:
+                infos = {**infos, **rollout_info}
                 infos_str = " | ".join(
                     [f"{key}: {val:8.4f}" for key, val in infos.items()]
                 )

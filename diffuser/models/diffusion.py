@@ -8,6 +8,7 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 import diffuser.utils as utils
 from diffuser.models.helpers import Losses, apply_conditioning
+from diffuser.models.q_pattern_obs import PatternEncoderObs, PatternQ, TransitionQ
 
 
 class GaussianDiffusion(nn.Module):
@@ -40,6 +41,12 @@ class GaussianDiffusion(nn.Module):
         share_inv: bool = True,
         joint_inv: bool = False,
         data_encoder: utils.Encoder = utils.IdentityEncoder(),
+        # --- Q_pattern (obs-diffusion) ---
+        use_q_pattern: bool = False,
+        q_pattern_latent_dim: int = 64,
+        q_pattern_hidden_dim: int = 512,
+        q_pattern_encoder_hidden_dim: int = 256,
+        transition_q_hidden_dim: int = 512,
         **kwargs,
     ):
         assert action_dim > 0
@@ -64,6 +71,7 @@ class GaussianDiffusion(nn.Module):
         self.share_inv = share_inv
         self.joint_inv = joint_inv
         self.data_encoder = data_encoder
+        self.use_q_pattern = use_q_pattern
 
         if self.use_inv_dyn:
             self.inv_model = self._build_inv_model(
@@ -96,6 +104,38 @@ class GaussianDiffusion(nn.Module):
         loss_weights = self.get_loss_weights(loss_discount, action_weight)
         loss_type = "state_l2" if self.use_inv_dyn else "l2"
         self.loss_fn = Losses[loss_type](loss_weights)
+
+        # ---------------- Q_pattern modules ----------------
+        # These are optional and are used by the Trainer (not inside p_losses).
+        if self.use_q_pattern:
+            horizon_total = self.horizon + self.history_horizon
+            self.transition_q = TransitionQ(
+                observation_dim=self.observation_dim,
+                n_agents=self.n_agents,
+                history_horizon=self.history_horizon,
+                hidden_dim=transition_q_hidden_dim,
+            )
+            self.pattern_encoder = PatternEncoderObs(
+                observation_dim=self.observation_dim,
+                n_agents=self.n_agents,
+                horizon_total=horizon_total,
+                hidden_dim=q_pattern_encoder_hidden_dim,
+                latent_dim=q_pattern_latent_dim,
+            )
+            self.pattern_q = PatternQ(
+                observation_dim=self.observation_dim,
+                n_agents=self.n_agents,
+                history_horizon=self.history_horizon,
+                pattern_latent_dim=q_pattern_latent_dim,
+                hidden_dim=q_pattern_hidden_dim,
+            )
+
+    def _maybe_init_ddim(self, n_ddim_steps: int = 15):
+        if getattr(self, "ddim_noise_scheduler", None) is None:
+            self.set_ddim_scheduler(n_ddim_steps=n_ddim_steps)
+        else:
+            # Ensure timesteps reflect the requested n_ddim_steps
+            self.ddim_noise_scheduler.set_timesteps(n_ddim_steps)
 
     def _build_inv_model(self, hidden_dim: int, output_dim: int):
         if self.joint_inv:
@@ -273,6 +313,63 @@ class GaussianDiffusion(nn.Module):
             return x, torch.stack(diffusion, dim=1)
         else:
             return x
+
+    def conditional_sample_grad(
+        self,
+        cond: Dict[str, torch.Tensor],
+        returns: Optional[torch.Tensor] = None,
+        env_ts: Optional[torch.Tensor] = None,
+        horizon: int = None,
+        attention_masks: Optional[torch.Tensor] = None,
+        n_ddim_steps: int = 15,
+        use_cfg: bool = True,
+        return_diffusion: bool = True,
+    ):
+        """
+        Differentiable DDIM rollout used for Q_pattern training.
+        Returns:
+            x_final: [B, T, A, obs_dim]
+            diffusion_chain (optional): [B, K, T, A, obs_dim]
+        """
+        batch_size = cond["x"].shape[0]
+        horizon = horizon or self.horizon + self.history_horizon
+        shape = (batch_size, horizon, self.n_agents, self.observation_dim)
+        device = list(cond.values())[0].device
+
+        self._maybe_init_ddim(n_ddim_steps=n_ddim_steps)
+        scheduler: DDIMScheduler = self.ddim_noise_scheduler
+
+        x = 0.5 * torch.randn(shape, device=device)
+        diffusion = [x] if return_diffusion else None
+
+        for t in scheduler.timesteps:
+            x = apply_conditioning(x, cond)
+            x = self.data_encoder(x)
+            ts = torch.full((batch_size,), int(t), device=device, dtype=torch.long)
+
+            if use_cfg and self.returns_condition:
+                model_output = self.get_model_output(x, ts, returns, env_ts, attention_masks)
+            else:
+                model_output = self.model(
+                    x,
+                    ts,
+                    returns=returns,
+                    env_timestep=env_ts,
+                    attention_masks=attention_masks,
+                )
+                if not self.predict_epsilon:
+                    model_output = apply_conditioning(model_output, cond)
+                    model_output = self.data_encoder(model_output)
+
+            x = scheduler.step(model_output, t, x).prev_sample
+            if return_diffusion:
+                diffusion.append(x)
+
+        x = apply_conditioning(x, cond)
+        x = self.data_encoder(x)
+        if return_diffusion:
+            return x, torch.stack(diffusion, dim=1)
+        return x
 
     # ------------------------------------------ training ------------------------------------------#
 

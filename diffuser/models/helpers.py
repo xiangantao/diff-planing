@@ -192,14 +192,25 @@ def extract(a, t, x_shape):
 
 
 def apply_conditioning(x, conditions):
-    cond_masks = conditions["masks"].to(bool)
-    x[cond_masks] = conditions["x"][cond_masks].clone()
+    """
+    Apply inpainting-style conditioning.
+
+    IMPORTANT: this function must be differentiable-friendly because we may run
+    gradient-based sampling (e.g., DDIM rollouts during training). Avoid in-place
+    writes on tensors that participate in autograd graphs.
+    """
+    cond_masks = conditions["masks"].to(torch.bool)
+    # Non-inplace: keep gradient flow for unconditioned entries.
+    x = torch.where(cond_masks, conditions["x"], x)
 
     if "player_idxs" in conditions.keys():
         if x.shape[-1] < 4:  # pure position information w.o. player info
             x = torch.cat([conditions["player_idxs"], x], dim=-1)
             x = torch.cat([x, conditions["player_hoop_sides"]], dim=-1)
         else:
+            # These are deterministic overwrites for extra conditioning channels.
+            # Use cloning to avoid in-place ops if x requires grad.
+            x = x.clone()
             x[:, :, :, 0] = conditions["player_idxs"]
             x[:, :, :, -1] = conditions["player_hoop_sides"]
 

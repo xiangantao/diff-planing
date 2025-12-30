@@ -163,8 +163,9 @@ class MADEvaluatorWorker(Process):
         }
 
         self.trainer.step = state_dict["step"]
-        self.trainer.model.load_state_dict(state_dict["model"])
-        self.trainer.ema_model.load_state_dict(state_dict["ema"])
+        # allow optional modules to be added over time (e.g., Q_pattern) without breaking evaluation
+        self.trainer.model.load_state_dict(state_dict["model"], strict=False)
+        self.trainer.ema_model.load_state_dict(state_dict["ema"], strict=False)
 
         num_eval = Config.num_eval
         num_envs = Config.num_envs

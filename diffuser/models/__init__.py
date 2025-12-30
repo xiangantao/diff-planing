@@ -1,5 +1,6 @@
 from .bc import BehaviorClone
 from .diffusion import GaussianDiffusion, ValueDiffusion
+from .q_pattern_obs import PatternEncoderObs, PatternQ, TransitionQ
 from .ma_nontemporal_wrappers import IndependentBCMLPnet, SharedBCMLPnet
 from .ma_temporal import (
     ConcatTemporalValue,
