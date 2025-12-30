@@ -6,6 +6,7 @@ import pickle
 import sys
 import time
 import importlib
+import json
 from collections import deque
 from copy import deepcopy, copy
 from multiprocessing import Pipe, connection
@@ -217,6 +218,21 @@ class MADEvaluatorWorker(Process):
             save_file_path,
         )
 
+        # Also append a compact summary to a single file for easy plotting/grepping.
+        results_dir = os.path.join(self.log_dir, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        summary_path = os.path.join(results_dir, "eval_summary.jsonl")
+        record = {
+            "time": time.time(),
+            "step": int(load_step) if load_step is not None else None,
+            "num_eval": int(num_eval),
+            "use_ddim_sample": bool(getattr(Config, "use_ddim_sample", False)),
+        }
+        for k, v in metrics_dict.items():
+            record[k] = v.tolist() if isinstance(v, np.ndarray) else float(v)
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def _update_return_to_go(self, rtg, reward):
         rtg = rtg * self.Config.returns_scale
         reward = torch.tensor(reward, device=rtg.device, dtype=rtg.dtype).reshape(1, -1)
@@ -334,14 +350,16 @@ class MADEvaluatorWorker(Process):
                         episode_rewards[i] += this_reward
                         if "battle_won" in this_info.keys():
                             episode_wins[i] = this_info["battle_won"]
-                            logger.print(
-                                f"Episode ({i}): battle won {episode_wins[i]}",
-                                color="green",
-                            )
+                            if getattr(Config, "log_episode_details", False):
+                                logger.print(
+                                    f"Episode ({i}): battle won {episode_wins[i]}",
+                                    color="green",
+                                )
 
-                        logger.print(
-                            f"Episode ({i}): {episode_rewards[i]}", color="green"
-                        )
+                        if getattr(Config, "log_episode_details", False):
+                            logger.print(
+                                f"Episode ({i}): {episode_rewards[i]}", color="green"
+                            )
 
                     else:
                         episode_rewards[i] += this_reward

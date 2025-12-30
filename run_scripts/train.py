@@ -171,6 +171,8 @@ def main(Config, RUN):
         rollout_use_cfg=getattr(Config, "rollout_use_cfg", True),
         rollout_policy_weight=getattr(Config, "rollout_policy_weight", 0.1),
         rollout_bc_weight=getattr(Config, "rollout_bc_weight", 1.0),
+        transition_q_pretrain_steps=getattr(Config, "transition_q_pretrain_steps", 0),
+        pattern_q_warmup_steps=getattr(Config, "pattern_q_warmup_steps", 0),
     )
 
     evaluator_config = utils.Config(

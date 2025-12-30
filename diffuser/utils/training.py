@@ -71,6 +71,8 @@ class Trainer(object):
         rollout_use_cfg: bool = True,
         rollout_policy_weight: float = 0.1,
         rollout_bc_weight: float = 1.0,
+        transition_q_pretrain_steps: int = 0,
+        pattern_q_warmup_steps: int = 0,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -124,6 +126,9 @@ class Trainer(object):
         self.rollout_use_cfg = bool(rollout_use_cfg)
         self.rollout_policy_weight = float(rollout_policy_weight)
         self.rollout_bc_weight = float(rollout_bc_weight)
+        self.transition_q_pretrain_steps = int(transition_q_pretrain_steps)
+        self.pattern_q_warmup_steps = int(pattern_q_warmup_steps)
+        self.qpattern_enable_step = self.transition_q_pretrain_steps + self.pattern_q_warmup_steps
 
         self.transition_q_optimizer = None
         self.pattern_q_optimizer = None
@@ -310,16 +315,33 @@ class Trainer(object):
                     and (self.step % self.rollout_every == 0)
                     and i == 0
                 ):
-                    policy_loss, rollout_inv_loss, pattern_q_loss, roll_infos = (
-                        self._qpattern_rollout_losses(batch)
-                    )
-                    rollout_info = roll_infos
-                    loss = (
-                        loss
-                        + self.rollout_policy_weight * policy_loss
-                        + self.rollout_bc_weight * rollout_inv_loss
-                    )
-                    pattern_q_loss_to_step = pattern_q_loss
+                    # Phase 0: pretrain transition_q only (no rollout)
+                    if self.step < self.transition_q_pretrain_steps:
+                        rollout_info["qpattern_phase"] = torch.tensor(
+                            0.0, device=loss.device
+                        )
+                    else:
+                        policy_loss, rollout_inv_loss, pattern_q_loss, roll_infos = (
+                            self._qpattern_rollout_losses(batch)
+                        )
+                        rollout_info = roll_infos
+                        pattern_q_loss_to_step = pattern_q_loss
+
+                        # Phase 1: warm up pattern_q (distillation only; do not push policy)
+                        if self.step < self.qpattern_enable_step:
+                            rollout_info["qpattern_phase"] = torch.tensor(
+                                1.0, device=loss.device
+                            )
+                        else:
+                            # Phase 2: full Q_pattern rollout policy improvement
+                            rollout_info["qpattern_phase"] = torch.tensor(
+                                2.0, device=loss.device
+                            )
+                            loss = (
+                                loss
+                                + self.rollout_policy_weight * policy_loss
+                                + self.rollout_bc_weight * rollout_inv_loss
+                            )
 
                 (loss / self.gradient_accumulate_every).backward()
 
